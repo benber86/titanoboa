@@ -1,4 +1,4 @@
-from functools import cached_property, lru_cache
+from functools import cached_property
 
 import coverage
 import coverage.plugin
@@ -104,46 +104,6 @@ def _is_null_return(ast_node):
     return False
 
 
-def _resolve_if(pc, ast_map, bytecode):
-    """Find the If node that owns the JUMPI at *pc*.
-
-    Direct hit: ast_map[pc] is an If node.
-    Backward scan: for unmapped JUMPIs (peephole optimizer), check the
-    nearest mapped PC before the JUMPI.
-    """
-    if bytecode[pc] != _JUMPI:
-        return None
-
-    node = ast_map.get(pc)
-    if isinstance(node, vy_ast.If):
-        return node
-    if isinstance(node, vy_ast.BoolOp):
-        return None  # short-circuit, not a branch decision
-
-    for offset in range(1, 11):
-        prev = ast_map.get(pc - offset)
-        if prev is None:
-            continue
-        if isinstance(prev, vy_ast.If):
-            return prev
-        if isinstance(prev, (vy_ast.Break, vy_ast.Continue)):
-            cur = prev._parent
-            while cur is not None:
-                if isinstance(cur, vy_ast.If):
-                    return cur
-                cur = getattr(cur, "_parent", None)
-            return None
-        # check if prev is inside an If.test subtree
-        child, parent = prev, getattr(prev, "_parent", None)
-        while parent is not None:
-            if isinstance(parent, vy_ast.If) and child is parent.test:
-                return parent
-            child, parent = parent, getattr(parent, "_parent", None)
-        return None
-
-    return None
-
-
 def _branch_arcs_for_if(if_node, fn_node):
     """Compute (arc_true, arc_false) line targets for an If node."""
     arc_true = if_node.body[0].lineno
@@ -195,55 +155,18 @@ def _is_noop_branch(if_node):
     return _is_noop_body(if_node.body)
 
 
-def _taken_is_true(if_node):
-    """Return True if JUMPI taken = true branch for this If node.
-
-    Vyper compiles different If patterns with different jump polarity:
-    - 3-arg (real else): taken = true branch
-    - break/continue/bare return: optimizer inverts → taken = true branch
-    - everything else (simple 2-arg if): taken = false (past body)
-    """
-    has_real_else = if_node.orelse and not _is_noop_body(if_node.orelse)
-    if has_real_else:
-        return True
-    if isinstance(if_node.body[0], (vy_ast.Break, vy_ast.Continue)):
-        return True
-    if _is_null_return(if_node.body[0]):
-        return True
-    return False
-
-
-@lru_cache(maxsize=128)
-def _build_jumpi_table(bytecode: bytes) -> dict:
-    """Map each JUMPI PC -> (taken_dest, fallthrough_pc)."""
-    table: dict[int, tuple[int, int]] = {}
-    last_push_value = None
-    pc = 0
-    while pc < len(bytecode):
-        op = bytecode[pc]
-        if op == _JUMPI and last_push_value is not None:
-            table[pc] = (last_push_value, pc + 1)
-        if 0x5F <= op <= 0x7F:
-            n = op - 0x5F
-            last_push_value = (
-                0 if n == 0 else int.from_bytes(bytecode[pc + 1 : pc + 1 + n], "big")
-            )
-            pc += n + 1
-        else:
-            if op != _JUMPI:
-                last_push_value = None
-            pc += 1
-    return table
-
-
 def _record_coverage(bytecode, raw_trace, ast_map):
-    """Walk raw_trace, record line hits and branch arcs."""
-    lines_by_file = {}
-    arcs_by_file = {}
-    jumpi_table = _build_jumpi_table(bytecode)
+    """Walk raw_trace, record line hits and branch arcs.
 
-    # cache: jumpi_pc -> resolved info or None
-    resolved = {}
+    Coverage forces unoptimized compilation so every branch JUMPI maps
+    directly to its If node. Polarity is always: fallthrough (pc+1) =
+    true branch, taken = false branch.
+    """
+    lines_by_file: dict[str, set] = {}
+    arcs_by_file: dict[str, set] = {}
+
+    # cache: jumpi_pc -> (filename, if_lineno, arc_true, arc_false) or None
+    resolved: dict[int, tuple | None] = {}
 
     for i, pc in enumerate(raw_trace):
         node = ast_map.get(pc)
@@ -256,8 +179,8 @@ def _record_coverage(bytecode, raw_trace, ast_map):
             continue
 
         if pc not in resolved:
-            if_node = _resolve_if(pc, ast_map, bytecode)
-            if if_node is None:
+            if_node = ast_map.get(pc)
+            if not isinstance(if_node, vy_ast.If):
                 resolved[pc] = None
                 continue
             fn_node = get_fn_ancestor_from_node(if_node)
@@ -269,28 +192,18 @@ def _record_coverage(bytecode, raw_trace, ast_map):
                 resolved[pc] = None
                 continue
             arc_true, arc_false = _branch_arcs_for_if(if_node, fn_node)
-            resolved[pc] = (
-                filename,
-                if_node.lineno,
-                arc_true,
-                arc_false,
-                _taken_is_true(if_node),
-            )
+            resolved[pc] = (filename, if_node.lineno, arc_true, arc_false)
 
         info = resolved[pc]
         if info is None:
             continue
 
-        filename, if_lineno, arc_true, arc_false, taken_is_true = info
-        entry = jumpi_table.get(pc)
-        if entry is None:
-            continue
+        filename, if_lineno, arc_true, arc_false = info
 
-        taken_dest, _ = entry
-        was_taken = i + 1 < len(raw_trace) and raw_trace[i + 1] == taken_dest
-
+        # fallthrough (pc+1) = true branch, taken = false branch
+        fell_through = i + 1 < len(raw_trace) and raw_trace[i + 1] == pc + 1
         arcs = arcs_by_file.setdefault(filename, set())
-        if was_taken == taken_is_true:
+        if fell_through:
             arcs.add((if_lineno, arc_true))
         else:
             arcs.add((if_lineno, arc_false))
@@ -303,7 +216,7 @@ def _flush_coverage(lines_by_file, arcs_by_file):
     cov = coverage.Coverage.current()
     if cov is None or not cov.config.branch:
         return
-    merged = {}
+    merged: dict[str, set] = {}
     for filename, lines in lines_by_file.items():
         merged.setdefault(filename, set()).update((-1, ln) for ln in lines)
     for filename, arcs in arcs_by_file.items():
