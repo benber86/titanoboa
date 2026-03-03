@@ -6,12 +6,17 @@ import vyper.ast as vy_ast
 from vyper.ast.parse import parse_to_ast
 
 from boa.contracts.vyper.ast_utils import get_fn_ancestor_from_node
-from boa.environment import Env
+
+# boa.environment imports from this module, so we can't import Env at
+# the top level.  import it lazily where needed to avoid the cycle.
+# (environment.py is the lower-level module; coverage.py is the plugin.)
 
 _JUMPI = 0x57
 
 
 def coverage_init(registry, options):
+    from boa.environment import Env
+
     plugin = TitanoboaPlugin(options)
     registry.add_file_tracer(plugin)
     registry.add_configurer(plugin)
@@ -47,6 +52,8 @@ class TitanoboaTracer(coverage.plugin.FileTracer):
     # from there.
 
     def _valid_frame(self, frame):
+        from boa.environment import Env
+
         if hasattr(frame.f_code, "co_qualname"):
             # Python>=3.11
             code_qualname = frame.f_code.co_qualname
@@ -78,8 +85,7 @@ class TitanoboaTracer(coverage.plugin.FileTracer):
 
         # when branch coverage is active, suppress the pytracer's arc
         # generation — we record branch arcs directly from the EVM trace.
-        cov = coverage.Coverage.current()
-        if cov is not None and cov.config.branch:
+        if _get_branch_cov() is not None:
             return (-1, -1)
 
         ast_node = frame.f_locals["node"]
@@ -111,12 +117,12 @@ def _branch_arcs_for_if(if_node, fn_node):
         arc_true = fn_node.lineno
 
     parent = if_node._parent
-    if hasattr(parent, "orelse") and any(id(s) == id(if_node) for s in parent.orelse):
+    if hasattr(parent, "orelse") and any(s is if_node for s in parent.orelse):
         siblings = parent.orelse
     else:
         siblings = parent.body
     for node, next_ in zip(siblings, siblings[1:]):
-        if id(node) == id(if_node):
+        if node is if_node:
             arc_false = next_.lineno
             break
     else:
@@ -155,18 +161,18 @@ def _is_noop_branch(if_node):
     return _is_noop_body(if_node.body)
 
 
-def _record_coverage(bytecode, raw_trace, ast_map):
+def _record_coverage(bytecode, raw_trace, ast_map, skip_arcs=False):
     """Walk raw_trace, record line hits and branch arcs.
 
-    Coverage forces unoptimized compilation so every branch JUMPI maps
-    directly to its If node. Polarity is always: fallthrough (pc+1) =
-    true branch, taken = false branch.
+    Branch arc resolution requires unoptimized bytecode where every
+    JUMPI maps directly to its If node and polarity is always:
+    fallthrough (pc+1) = true branch, taken = false branch.
+    Callers should set skip_arcs=True for optimized contracts.
     """
     lines_by_file: dict[str, set] = {}
     arcs_by_file: dict[str, set] = {}
 
-    # cache: jumpi_pc -> (filename, if_lineno, arc_true, arc_false) or None
-    resolved: dict[int, tuple | None] = {}
+    resolved: dict[int, tuple[str, int, int, int] | None] = {}
 
     for i, pc in enumerate(raw_trace):
         node = ast_map.get(pc)
@@ -175,24 +181,23 @@ def _record_coverage(bytecode, raw_trace, ast_map):
             if filename.endswith(".vy"):
                 lines_by_file.setdefault(filename, set()).add(node.lineno)
 
-        if bytecode[pc] != _JUMPI:
+        if skip_arcs or bytecode[pc] != _JUMPI:
             continue
 
         if pc not in resolved:
-            if_node = ast_map.get(pc)
-            if not isinstance(if_node, vy_ast.If):
+            if not isinstance(node, vy_ast.If):
                 resolved[pc] = None
                 continue
-            fn_node = get_fn_ancestor_from_node(if_node)
+            fn_node = get_fn_ancestor_from_node(node)
             if fn_node is None:
                 resolved[pc] = None
                 continue
-            filename = if_node.module_node.resolved_path
+            filename = node.module_node.resolved_path
             if not filename.endswith(".vy"):
                 resolved[pc] = None
                 continue
-            arc_true, arc_false = _branch_arcs_for_if(if_node, fn_node)
-            resolved[pc] = (filename, if_node.lineno, arc_true, arc_false)
+            arc_true, arc_false = _branch_arcs_for_if(node, fn_node)
+            resolved[pc] = (filename, node.lineno, arc_true, arc_false)
 
         info = resolved[pc]
         if info is None:
@@ -211,11 +216,16 @@ def _record_coverage(bytecode, raw_trace, ast_map):
     return lines_by_file, arcs_by_file
 
 
-def _flush_coverage(lines_by_file, arcs_by_file):
-    """Write line and branch arcs to the active coverage instance."""
+def _get_branch_cov():
+    """Return the active Coverage instance if branch mode is on, else None."""
     cov = coverage.Coverage.current()
-    if cov is None or not cov.config.branch:
-        return
+    if cov is not None and cov.config.branch:
+        return cov
+    return None
+
+
+def _flush_coverage(cov, lines_by_file, arcs_by_file):
+    """Write line and branch arcs to the active coverage instance."""
     merged: dict[str, set] = {}
     for filename, lines in lines_by_file.items():
         merged.setdefault(filename, set()).update((-1, ln) for ln in lines)
@@ -254,32 +264,18 @@ class TitanoboaReporter(coverage.plugin.FileReporter):
 
     @cached_property
     def _lines(self):
-        # lines that only appear as part of multiline if conditions
-        # or keyword-only lines should be excluded
-        exclude = set()
-        for if_node in self._ast.get_descendants(vy_ast.If):
-            for node in if_node.test.get_descendants():
-                if node.lineno != if_node.lineno and not isinstance(
-                    node, vy_ast.Operator
-                ):
-                    exclude.add(node.lineno)
-        for node in self._ast.get_descendants(vy_ast.Return):
-            desc_linenos = {n.lineno for n in node.get_descendants()}
-            if node.lineno not in desc_linenos:
-                exclude.add(node.lineno)
-
         ret = set()
+
         functions = self._ast.get_children(vy_ast.FunctionDef)
+
         for f in functions:
             for stmt in f.body:
-                if stmt.lineno not in exclude:
-                    ret.add(stmt.lineno)
+                ret.add(stmt.lineno)
                 for node in stmt.get_descendants():
                     if isinstance(node, vy_ast.AnnAssign) and isinstance(
                         node.parent, vy_ast.For
                     ):
-                        continue
-                    if node.lineno in exclude:
+                        # tokenizer bug with vyper parser, just ignore it
                         continue
                     ret.add(node.lineno)
 
