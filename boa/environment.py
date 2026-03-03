@@ -12,7 +12,6 @@ from typing import Any, Optional, TypeAlias
 import eth.constants as constants
 from eth_typing import Address as PYEVM_Address  # it's just bytes.
 
-from boa.coverage import CoverageCollector, _build_coverage_events
 from boa.rpc import RPC, EthereumRPC
 from boa.util.abi import Address
 from boa.vm.gas_meters import GasMeter, NoGasMeter, ProfilingGasMeter
@@ -249,9 +248,7 @@ class Env:
         )
 
         if self._coverage_enabled:
-            collector = CoverageCollector()
-            self._trace_computation(computation, contract, collector)
-            collector.flush()
+            self._trace_computation(computation, contract)
 
         if computation._gas_meter_class != NoGasMeter:
             self._update_gas_used(computation.get_gas_used())
@@ -340,33 +337,47 @@ class Env:
                 contract=contract,
             )
             if self._coverage_enabled:
-                collector = CoverageCollector()
-                self._trace_computation(ret, contract, collector)
-                collector.flush()
+                self._trace_computation(ret, contract)
 
             if ret._gas_meter_class != NoGasMeter:
                 self._update_gas_used(ret.get_gas_used())
 
             return ret
 
-    def _trace_computation(self, computation, contract, collector):
+    # trace pcs for coverage sake. dummy function which
+    # just issues the right calls to _trace_cov() to get picked
+    # up by coverage. bit ugly, but tracer only allows
+    # dynamic_source_filename to be set once per (python) function call,
+    # so we need to use this in case the pc trace covers multiple files
+    def _trace_computation(self, computation, contract=None):
         # perf: don't trace if contract is None
         if contract is not None and hasattr(contract, "source_map"):
             ast_map = contract.source_map["pc_raw_ast_map"]
-            raw_trace = list(computation.code._trace)
-            segments = _build_coverage_events(raw_trace, ast_map)
+            seen_pcs = set()
+            for pc in computation.code._trace:
+                if pc in seen_pcs:
+                    continue
+                if (node := ast_map.get(pc)) is not None:
+                    mod = node.module_node
+                    self._trace_cov(mod.resolved_path, node)
+                seen_pcs.add(pc)
+
+            # record branch arcs + line coverage from the raw trace
+            from boa.coverage import _flush_coverage, _record_coverage
+
             bytecode = computation.code._raw_code_bytes
-            trace_id = collector.next_trace_id()
-            for filename, events in segments:
-                collector.record_segment(
-                    filename, events, bytecode, raw_trace, ast_map, trace_id
-                )
+            raw_trace = list(computation.code._trace)
+            lines, arcs = _record_coverage(bytecode, raw_trace, ast_map)
+            _flush_coverage(lines, arcs)
 
         for child in computation.children:
             if child.msg.code_address == b"":
                 continue
             child_contract = self._lookup_contract_fast(child.msg.code_address)
-            self._trace_computation(child, child_contract, collector)
+            self._trace_computation(child, child_contract)
+
+    def _trace_cov(self, filename, node):
+        pass
 
     def get_code(self, address: _AddressType) -> bytes:
         return self.evm.get_code(Address(address))
